@@ -18,6 +18,8 @@ import scala.language.existentials
 import scala.util.{ Failure, Success }
 import scala.collection.JavaConverters._
 
+import FlowErrorLogging._
+
 private object PoolSlot {
   import PoolFlow.{ RequestContext, ResponseContext }
 
@@ -65,6 +67,7 @@ private object PoolSlot {
 
       def disconnect(ex: Option[Throwable] = None) = {
         connectionFlowSource.complete()
+        println(s"$slotIx disconnecting... isConnected: $isConnected ex.isDefined: ${ex.isDefined}, inflights: ${inflightRequests.size}")
         if (isConnected) {
           isConnected = false
 
@@ -76,6 +79,8 @@ private object PoolSlot {
             val failures = inflightFail.map(rc ⇒ ResponseContext(rc, Failure(fail))).toList
             (retries, failures)
           }.getOrElse((inflightRequests.iterator().asScala.map(rc ⇒ SlotEvent.RetryRequest(rc)).toList, Nil))
+
+          println(s"$slotIx retries: $retries failures: $failures")
 
           inflightRequests.clear()
 
@@ -117,7 +122,10 @@ private object PoolSlot {
 
         override def onUpstreamFinish(): Unit = disconnect()
 
-        override def onUpstreamFailure(ex: Throwable): Unit = disconnect(Some(ex))
+        override def onUpstreamFailure(ex: Throwable): Unit = {
+          println(s"$slotIx connection failed with ${ex.getMessage}")
+          disconnect(Some(ex))
+        }
       }
 
       // upstream pushes we create the inner stream if necessary or push if we're already connected
@@ -132,7 +140,18 @@ private object PoolSlot {
           isConnected = true
 
           Source.fromGraph(connectionFlowSource.source)
-            .via(connectionFlow).runWith(Sink.fromGraph(connectionFlowSink.sink))(subFusingMaterializer)
+            .via(handleCompletion {
+              case Cancelled      ⇒ println(s"$slotIx (1) connection cancelled slot")
+              case Completed      ⇒ println(s"$slotIx (2) completed connection")
+              case Errored(error) ⇒ println(s"$slotIx (3) errored connection")
+            })
+            .via(connectionFlow)
+            .via(handleCompletion {
+              case Cancelled      ⇒ println(s"$slotIx (4) cancelled connection")
+              case Completed      ⇒ println(s"$slotIx (5) connection was completed")
+              case Errored(error) ⇒ println(s"$slotIx (6) connection errored with ${error.getMessage}")
+            })
+            .runWith(connectionFlowSink.sink)(subFusingMaterializer)
 
           connectionFlowSink.pull()
         }
@@ -167,4 +186,53 @@ private object PoolSlot {
       setHandler(eventsOut, EagerTerminateOutput)
     }
   }
+
+}
+
+object FlowErrorLogging {
+  sealed trait FlowCompletion
+  case object Cancelled extends FlowCompletion
+  case object Completed extends FlowCompletion
+  case class Errored(error: Throwable) extends FlowCompletion
+
+  def logCompletion[T](prefix: String): Flow[T, T, akka.NotUsed] =
+    handleCompletion {
+      case Cancelled ⇒ println(s"$prefix was cancelled")
+      case Completed ⇒ println(s"$prefix was completed")
+      case Errored(ex) ⇒
+        println(s"$prefix was errored with ${ex.getMessage}")
+        ex.printStackTrace()
+    }
+
+  def handleCompletion[T](handler: FlowCompletion ⇒ Unit): Flow[T, T, akka.NotUsed] =
+    Flow.fromGraph(new GraphStage[FlowShape[T, T]] {
+      val in = Inlet[T]("in")
+      val out = Outlet[T]("out")
+
+      val shape = FlowShape(in, out)
+
+      def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) with InHandler with OutHandler {
+
+        setHandlers(in, out, this)
+
+        override def onUpstreamFinish(): Unit = {
+          handler(Completed)
+          super.onUpstreamFinish()
+        }
+
+        @scala.throws[Exception](classOf[Exception])
+        override def onDownstreamFinish(): Unit = {
+          handler(Cancelled)
+          super.onDownstreamFinish()
+        }
+
+        override def onUpstreamFailure(ex: Throwable): Unit = {
+          handler(Errored(ex))
+          super.onUpstreamFailure(ex)
+        }
+
+        def onPush(): Unit = emit(out, grab(in))
+        def onPull(): Unit = pull(in)
+      }
+    })
 }

@@ -5,13 +5,14 @@
 package akka.http.impl.engine.client
 
 import akka.NotUsed
-import akka.http.impl.engine.client.PoolConductor.PoolSlotsSetting
+import akka.http.impl.engine.client.PoolConductor.{ PoolSlotsSetting, SlotCommand }
 import akka.http.scaladsl.settings.ConnectionPoolSettings
 
-import scala.concurrent.{ Promise, Future }
+import scala.concurrent.{ Future, Promise }
 import scala.util.Try
 import akka.event.LoggingAdapter
 import akka.actor._
+import akka.http.impl.engine.client.PoolSlot.RawSlotEvent
 import akka.stream.{ FlowShape, Materializer }
 import akka.stream.scaladsl._
 import akka.http.scaladsl.model._
@@ -90,10 +91,15 @@ private object PoolFlow {
 
       slotEventMerge.out ~> conductor.slotEventIn
       for ((slot, ix) ← slots.zipWithIndex) {
-        conductor.slotOuts(ix) ~> slot.in
+        conductor.slotOuts(ix) ~> Flow[SlotCommand].log(s"slotCommandIn $ix") ~> slot.in
         slot.out0 ~> responseMerge.in(ix)
-        slot.out1 ~> slotEventMerge.in(ix)
+        slot.out1 ~> Flow[RawSlotEvent].log(s"slotEvents $ix") ~> slotEventMerge.in(ix)
       }
-      FlowShape(conductor.requestIn, responseMerge.out)
+      val logRequestsIn = b.add(Flow[RequestContext].log("requestIn"))
+      val logResponseOut = b.add(Flow[ResponseContext].log("responseOut").via(FlowErrorLogging.logCompletion("responseOut")))
+      logRequestsIn.out ~> conductor.requestIn
+      responseMerge.out ~> logResponseOut.in
+
+      FlowShape(logRequestsIn.in, logResponseOut.out)
     })
 }
