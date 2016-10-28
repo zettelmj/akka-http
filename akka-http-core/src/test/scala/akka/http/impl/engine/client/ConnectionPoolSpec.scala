@@ -10,28 +10,30 @@ import java.nio.channels.{ ServerSocketChannel, SocketChannel }
 import java.util.concurrent.atomic.AtomicInteger
 
 import akka.http.impl.engine.client.PoolMasterActor.PoolInterfaceRunning
+import akka.http.impl.engine.ws.ByteStringSinkProbe
 import akka.http.impl.settings.ConnectionPoolSettingsImpl
 import akka.http.impl.util.SingletonException
 import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.headers._
 import akka.http.scaladsl.settings.{ ClientConnectionSettings, ConnectionPoolSettings, ServerSettings }
 import akka.http.scaladsl.{ Http, TestUtils }
-import akka.stream.ActorMaterializer
+import akka.stream.{ ActorMaterializer, FlowShape, Graph, SourceShape }
 import akka.stream.TLSProtocol._
 import akka.stream.scaladsl._
 import akka.stream.testkit.{ TestPublisher, TestSubscriber }
 import akka.testkit.AkkaSpec
 import akka.util.ByteString
 
+import scala.annotation.unchecked.uncheckedVariance
 import scala.collection.immutable
-import scala.concurrent.Await
+import scala.concurrent.{ Await, Future, Promise }
 import scala.concurrent.duration._
 import scala.util.control.NonFatal
 import scala.util.{ Failure, Success, Try }
 
 class ConnectionPoolSpec extends AkkaSpec("""
     akka.loggers = []
-    akka.loglevel = OFF
+    akka.loglevel = DEBUG
     akka.io.tcp.windows-connection-abort-workaround-enabled = auto
     akka.io.tcp.trace-logging = off""") {
   implicit val materializer = ActorMaterializer()
@@ -168,6 +170,61 @@ class ConnectionPoolSpec extends AkkaSpec("""
 
       responses mustContainLike { case (Success(x), 42) ⇒ requestUri(x) should endWith("/a") }
       responses mustContainLike { case (Failure(x), 43) ⇒ x.getMessage should include(ConnectionResetByPeerMessage) }
+    }
+
+    "properly surface connection-level and stream-level errors while receiving response entity" in new TestSetup(autoAccept = true) {
+      val errorOnConnection1 = Promise[ByteString]()
+
+      val crashingEntity =
+        Source.fromIterator(() ⇒ Iterator.fill(10)(ByteString("abc")))
+          .concat(Source.fromFuture(errorOnConnection1.future))
+          .log("test")
+
+      val laterData = Promise[ByteString]()
+      val slowEntity =
+        Source.single(ByteString("def")) ++ Source.fromFuture(laterData.future)
+
+      val laterHandler = Promise[(HttpRequest ⇒ Future[HttpResponse]) ⇒ Unit]()
+
+      override def asyncTestServerHandler(connNr: Int): HttpRequest ⇒ Future[HttpResponse] = { req ⇒
+        req.discardEntityBytes()
+        println(req.uri.path.toString)
+        if (req.uri.path.toString contains "a")
+          Future.successful(HttpResponse(200, entity = HttpEntity.CloseDelimited(ContentTypes.`application/octet-stream`, crashingEntity)))
+        else {
+          val response = Promise[HttpResponse]()
+          laterHandler.success(handler ⇒ response.completeWith(handler(req)))
+          response.future
+        }
+      }
+
+      val (requestIn, responseOut, responseOutSub, hcp) = cachedHostConnectionPool[Int](maxRetries = 0)
+
+      requestIn.sendNext(HttpRequest(uri = "/a") → 42)
+      responseOutSub.request(2)
+
+      val (Success(response1), _) = responseOut.expectNext()
+
+      val probe1 = ByteStringSinkProbe()
+      response1.entity.dataBytes.runWith(probe1.sink)
+
+      probe1.expectBytes(ByteString("abc" * 10))
+      //probe1.expectNoBytes()
+
+      // send second request
+      requestIn.sendNext(HttpRequest(uri = "/b") → 43)
+      // ensure that server has seen request 2
+      val handlerSetter = Await.result(laterHandler.future, 1.second)
+
+      errorOnConnection1.failure(new RuntimeException)
+
+      println("Waiting for error to trigger connection pool failure")
+      Thread.sleep(2000)
+      println("Now respond to request 2")
+
+      handlerSetter(req ⇒ Future.successful(HttpResponse()))
+
+      val (Success(response2), _) = responseOut.expectNext()
     }
 
     "retry failed requests" in new TestSetup(autoAccept = true) {
@@ -401,6 +458,11 @@ class ConnectionPoolSpec extends AkkaSpec("""
     autoAccept:     Boolean        = false) {
     val (serverEndpoint, serverHostName, serverPort) = TestUtils.temporaryServerHostnameAndPort()
 
+    def asyncTestServerHandler(connNr: Int): HttpRequest ⇒ Future[HttpResponse] = {
+      val handler = testServerHandler(connNr)
+      req ⇒ Future.successful(handler(req))
+    }
+
     def testServerHandler(connNr: Int): HttpRequest ⇒ HttpResponse = {
       r ⇒ HttpResponse(headers = responseHeaders(r, connNr), entity = r.entity)
     }
@@ -433,7 +495,7 @@ class ConnectionPoolSpec extends AkkaSpec("""
     }
 
     private def handleConnection(c: Http.IncomingConnection) =
-      c.handleWithSyncHandler(testServerHandler(incomingConnectionCounter.incrementAndGet()))
+      c.handleWithAsyncHandler(asyncTestServerHandler(incomingConnectionCounter.incrementAndGet()))
 
     def cachedHostConnectionPool[T](
       maxConnections:  Int                      = 2,
