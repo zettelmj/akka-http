@@ -31,10 +31,14 @@ class AkkaToStrictTests extends FlatSpec with ScalaFutures {
 
     /* Setup test route */
     val route = get {
+      val promise = Promise[ByteString]()
       val ent = HttpEntity.CloseDelimited(
         ContentTypes.`text/plain(UTF-8)`,
         Source.single(ByteString("Strictness FTW!"))
+          ++ Source.fromFuture(promise.future)
       )
+
+      system.scheduler.scheduleOnce(1.second)(promise.success(ByteString.empty))
 
       complete(HttpResponse(StatusCodes.OK, Nil, ent))
     }
