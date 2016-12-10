@@ -93,6 +93,23 @@ class HeaderDirectivesSpec extends RoutingSpec with Inside {
         }
       }
     }
+
+    lazy val routeWithHeaderDefault =
+      headerValueByName("correlationId", "default") { correlationId ⇒
+        complete(s"The correlationId is $correlationId")
+      }
+
+    "extract a header with Symbol name with default given" in {
+      Get("abc") ~> RawHeader("correlationId", "1") ~> routeWithHeaderDefault ~> check {
+        responseAs[String] shouldEqual "The correlationId is 1"
+      }
+    }
+
+    "use default if header is not present" in {
+      Get("abc") ~> routeWithHeaderDefault ~> check {
+        responseAs[String] shouldEqual "The correlationId is default"
+      }
+    }
   }
 
   "The optionalHeaderValueByName directive" should {

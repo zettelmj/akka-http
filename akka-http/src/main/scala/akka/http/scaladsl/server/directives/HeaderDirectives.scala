@@ -82,6 +82,15 @@ trait HeaderDirectives {
     headerValue(optionalValue(headerName.toLowerCase)) | reject(MissingHeaderRejection(headerName))
 
   /**
+   * Extracts the value of the HTTP request header with the given name.
+   * If no header with a matching name is found the given default is returned.
+   *
+   * @group header
+   */
+  def headerValueByName(headerName: String, default: String): Directive1[String] =
+    headerValue(optionalValue(headerName.toLowerCase)) | provide(default)
+
+  /**
    * Extracts the first HTTP request header of the given type.
    * If no header with a matching type is found the request is rejected with a [[akka.http.scaladsl.server.MissingHeaderRejection]].
    *
